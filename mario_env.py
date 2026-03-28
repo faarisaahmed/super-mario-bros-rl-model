@@ -13,6 +13,7 @@ BASE_WIDTH, BASE_HEIGHT = 256, 240
 SCREEN_WIDTH = BASE_WIDTH * SCALE
 SCREEN_HEIGHT = BASE_HEIGHT * SCALE
 
+# Matches mario.py exactly: self.gravity = 800 * scale
 GRAVITY_PER_SECOND = 800.0 * SCALE
 
 
@@ -29,26 +30,30 @@ class MarioEnv(gym.Env):
 
         self.camera_x = 0
         self.prev_x = self.mario.x
+        self.steps_since_progress = 0   # detects the agent getting stuck
 
         # Jump hold state — env simulates button hold internally
-        self._jump_frames_left = 0   # how many frames to keep boosting
+        self._jump_frames_left = 0
         self._jump_holding = False
 
-        # 0: idle  1: walk right  2: walk left
-        # 3: short jump+right (~6 frames)
-        # 4: full jump+right  (~18 frames, clears wide gaps)
-        # 5: full jump only   (no horizontal)
+        # Actions:
+        # 0: idle
+        # 1: walk right
+        # 2: walk left
+        # 3: short hop + right  (~6 frames hold → low arc, short gap)
+        # 4: full jump + right  (~18 frames hold → max arc, wide gap)
+        # 5: full jump only     (no horizontal, for jumping over walls)
         self.action_space = spaces.Discrete(6)
 
         # Observation (18 values):
-        #   0-1:   mario x, y
-        #   2-3:   velocity_x, velocity_y (normalised)
-        #   4:     on_ground
-        #   5-9:   ground sensors at 16,32,64,96,128 px ahead
-        #   10-14: wall sensors at 16,32,48,64,80 px ahead (at torso height)
-        #   15:    estimated landing_x
-        #   16:    gap_start_x  (0 if none)
-        #   17:    gap_end_x    (0 if none)
+        #  0-1:   mario x, y
+        #  2-3:   velocity_x, velocity_y
+        #  4:     on_ground (bool)
+        #  5-9:   ground sensors at 16, 32, 64, 96, 128 px ahead
+        #  10-14: wall sensors at 16, 32, 48, 64, 80 px ahead (torso height)
+        #  15:    estimated landing_x for full jump
+        #  16:    gap_start_x (0.0 if no gap found)
+        #  17:    gap_end_x   (0.0 if no gap found)
         self.observation_space = spaces.Box(
             low=-100_000, high=100_000,
             shape=(18,), dtype=np.float32
@@ -58,15 +63,18 @@ class MarioEnv(gym.Env):
             self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
             self.clock = pygame.time.Clock()
 
+    # ------------------------------------------------------------------
     def reset(self):
         self.level = Level("levels/1-1.json", "tileset.json")
         self.mario = Mario(x=100, y=0, scale=SCALE)
         self.camera_x = 0
         self.prev_x = self.mario.x
+        self.steps_since_progress = 0
         self._jump_frames_left = 0
         self._jump_holding = False
         return self._get_state()
 
+    # ------------------------------------------------------------------
     def step(self, action):
         dt = 1 / 60
         done = False
@@ -84,26 +92,39 @@ class MarioEnv(gym.Env):
         delta_x = self.mario.x - self.prev_x
 
         # ── 1. Progress reward ────────────────────────────────────────
+        # Full credit on ground, reduced in air so jumping isn't free
         if self.mario.on_ground:
-            reward += np.clip(delta_x, -8, 8) * 0.15
+            reward += np.clip(delta_x, -8, 8) * 0.1
         else:
-            reward += np.clip(delta_x, -8, 8) * 0.04
+            reward += np.clip(delta_x, -8, 8) * 0.03
 
+        # Penalise moving backwards
         if delta_x < 0:
+            reward -= 0.05
+
+        # ── 2. Stuck detection ────────────────────────────────────────
+        # If Mario hasn't made meaningful forward progress for 180 frames
+        # (3 seconds), apply a growing penalty to unstick him
+        if delta_x > 2.0:
+            self.steps_since_progress = 0
+        else:
+            self.steps_since_progress += 1
+
+        if self.steps_since_progress > 180:
+            reward -= 0.05  # escalating pressure to move
+
+        # ── 3. Grounded bonus / air tax ───────────────────────────────
+        if self.mario.on_ground:
+            reward += 0.02
+        else:
+            reward -= 0.01
+
+        # ── 4. Wall collision detection ───────────────────────────────
+        # If Mario tried to move right but barely moved, he hit a wall
+        if action in [1, 3, 4] and abs(delta_x) < 1.0 and was_on_ground:
             reward -= 0.08
 
-        # ── 2. Grounded bonus / air tax ───────────────────────────────
-        if self.mario.on_ground:
-            reward += 0.03
-        else:
-            reward -= 0.015
-
-        # ── 3. Wall collision penalty ─────────────────────────────────
-        # If Mario barely moved while trying to go right, he hit a wall
-        if action in [1, 3, 4] and delta_x < 1.0 and not self.mario.on_ground is False:
-            reward -= 0.1
-
-        # ── 4. Jump evaluation (fires once on jump frame) ─────────────
+        # ── 5. Jump evaluation (fires once, on the frame of the jump) ─
         jumped_this_step = action in [3, 4, 5] and was_on_ground
         if jumped_this_step:
             gap_start, gap_end = self._find_gap_ahead(max_look=250)
@@ -116,56 +137,57 @@ class MarioEnv(gym.Env):
             if has_gap and not has_wall:
                 clears = (landing_x is not None) and (landing_x >= gap_end)
                 if clears:
-                    # Bonus scales with gap width — harder gaps earn more
+                    # Scale bonus with gap width — harder gaps earn more
                     gap_width = gap_end - gap_start
-                    reward += 0.5 + min(gap_width / 200.0, 0.5)
+                    reward += 0.4 + min(gap_width / 300.0, 0.3)
                 else:
-                    reward -= 0.4   # jumped but arc won't clear it
+                    reward -= 0.3   # jumped but won't clear the gap
 
             elif has_wall and not has_gap:
-                reward -= 0.5   # jumped into a wall — bad
+                # Jumping over a wall is fine; jumping INTO one is not
+                if action == 5:
+                    reward += 0.1   # deliberate wall-jump, good
+                else:
+                    reward -= 0.3   # ran and jumped into a wall
 
             elif not has_gap and not has_wall:
-                reward -= 0.25  # unnecessary jump on flat ground
+                reward -= 0.2       # unnecessary jump on flat ground
 
-            # If both gap and wall: ambiguous, small penalty to discourage
+            # has_gap and has_wall together: ambiguous, small penalty
             elif has_gap and has_wall:
-                reward -= 0.1
+                reward -= 0.05
 
-        # ── 5. Air button spam ────────────────────────────────────────
+        # ── 6. Air spam penalty ───────────────────────────────────────
         if action in [3, 4, 5] and not was_on_ground:
-            reward -= 0.15
+            reward -= 0.1
 
-        # ── 6. Death / completion ─────────────────────────────────────
+        # ── 7. Death ──────────────────────────────────────────────────
+        # Scaled down from -150 so value function can converge
         floor_y = self.level.height * self.level.tile_size * SCALE
         if self.mario.y >= floor_y:
-            reward -= 150
+            reward -= 15
             done = True
 
+        # ── 8. Level completion ───────────────────────────────────────
+        # Scaled down from +300 for the same reason
         level_pixel_width = self.level.width * self.level.tile_size * SCALE
         if self.mario.x >= level_pixel_width - 50:
-            reward += 300
+            reward += 30
             done = True
 
-        reward -= 0.005  # tiny living penalty
+        # Tiny living penalty — prevents idle loops
+        reward -= 0.003
 
         self.prev_x = self.mario.x
         return self._get_state(), reward, done, {}
 
+    # ------------------------------------------------------------------
     def _apply_action(self, action, was_on_ground):
-        """
-        Actions 3/4/5 initiate a jump with a held duration.
-        The env ticks down _jump_frames_left each step, simulating
-        held Z — mario.py cuts the arc short if velocity_y is released.
-        """
         self.mario.velocity_x = 0
 
-        # Tick down any active jump hold
+        # Tick down active jump hold
         if self._jump_frames_left > 0:
             self._jump_frames_left -= 1
-            # Keep upward velocity boosted (simulate held jump)
-            # mario.py applies min_jump_velocity cut when Z is released,
-            # so as long as we keep calling with jump held, we get full arc
             self._jump_holding = self._jump_frames_left > 0
         else:
             self._jump_holding = False
@@ -180,7 +202,7 @@ class MarioEnv(gym.Env):
             self.mario.velocity_x = -self.mario.horizontal_speed
 
         elif action == 3:
-            # Short hop right — jump + right, hold for ~6 frames
+            # Short hop + right — low arc, clears small gaps
             self.mario.velocity_x = self.mario.horizontal_speed
             if was_on_ground:
                 self.mario.velocity_y = self.mario.jump_force
@@ -188,7 +210,7 @@ class MarioEnv(gym.Env):
                 self._jump_holding = True
 
         elif action == 4:
-            # Full jump right — hold for ~18 frames → maximum arc
+            # Full jump + right — max arc, clears wide gaps
             self.mario.velocity_x = self.mario.horizontal_speed
             if was_on_ground:
                 self.mario.velocity_y = self.mario.jump_force
@@ -196,27 +218,27 @@ class MarioEnv(gym.Env):
                 self._jump_holding = True
 
         elif action == 5:
-            # Full jump no horizontal (for jumping over walls in place)
+            # Full jump, no horizontal — for wall situations
             if was_on_ground:
                 self.mario.velocity_y = self.mario.jump_force
                 self._jump_frames_left = 18
                 self._jump_holding = True
 
-        # If we're mid-hold, keep applying horizontal for actions 3/4
+        # While mid-hold and airborne, keep horizontal velocity going
         if self._jump_holding and not was_on_ground:
             if action in [3, 4]:
                 self.mario.velocity_x = self.mario.horizontal_speed
 
-        # Simulate held jump: prevent mario.py's min_jump_velocity cut
-        # by keeping velocity_y below min_jump_velocity threshold while holding
+        # Simulate held/released jump button via min_jump_velocity cut
+        # mario.py applies this cut when Z is not held
         if self._jump_holding and self.mario.velocity_y < 0:
-            # Don't cut the jump arc — leave velocity_y alone
-            pass
+            pass  # holding — let the arc run fully
         elif not self._jump_holding and self.mario.velocity_y < self.mario.min_jump_velocity:
-            # Simulate releasing jump button — apply the cut
-            self.mario.velocity_y = self.mario.min_jump_velocity
+            self.mario.velocity_y = self.mario.min_jump_velocity  # cut arc short
 
+    # ------------------------------------------------------------------
     def _ground_ahead(self, pixels_ahead):
+        """True if a solid tile exists at foot level, pixels_ahead in front."""
         check_x = self.mario.x + pixels_ahead
         check_y = self.mario.y + (self.mario.height * self.mario.scale) + 5
         col = int(check_x // (self.level.tile_size * SCALE))
@@ -228,12 +250,9 @@ class MarioEnv(gym.Env):
         return tile_info is not None and tile_info.get("solid", False)
 
     def _wall_ahead(self, pixels_ahead):
-        """
-        Check for a solid tile at torso height ahead of Mario.
-        This distinguishes walls (jump over them) from gaps (jump across).
-        """
+        """True if a solid tile exists at torso height, pixels_ahead in front.
+        Distinguishes walls (solid ahead, ground present) from gaps (no ground)."""
         check_x = self.mario.x + (self.mario.width * self.mario.scale) + pixels_ahead
-        # Check at mid-body height
         check_y = self.mario.y + (self.mario.height * self.mario.scale) * 0.5
         col = int(check_x // (self.level.tile_size * SCALE))
         row = int(check_y // (self.level.tile_size * SCALE))
@@ -244,11 +263,14 @@ class MarioEnv(gym.Env):
         return tile_info is not None and tile_info.get("solid", False)
 
     def _find_gap_ahead(self, max_look=250):
+        """Scan forward to find the nearest gap in the ground.
+        Returns (gap_start_x, gap_end_x) in world pixels, or (None, None)."""
         tile_px = self.level.tile_size * SCALE
         gap_start = None
         gap_end = None
         x = self.mario.x
         end_x = x + max_look
+
         while x < end_x:
             if not self._ground_at_world_x(x):
                 if gap_start is None:
@@ -258,8 +280,10 @@ class MarioEnv(gym.Env):
                     gap_end = x
                     break
             x += tile_px
+
         if gap_start is not None and gap_end is None:
             gap_end = end_x
+
         return gap_start, gap_end
 
     def _ground_at_world_x(self, world_x):
@@ -273,43 +297,39 @@ class MarioEnv(gym.Env):
         return tile_info is not None and tile_info.get("solid", False)
 
     def _estimate_landing_x(self, action=4):
-        """
-        Predict landing x for the given action's hold duration.
-        Uses mario.py's exact physics: velocity_y += gravity * dt each frame.
-        """
+        """Frame-by-frame physics simulation of jump landing position.
+        Matches mario.py's exact integration: velocity_y += gravity * dt."""
         if not self.mario.on_ground:
             return None
 
-        gravity = GRAVITY_PER_SECOND
-        vy = self.mario.jump_force
-        vx = self.mario.horizontal_speed
-
-        # Simulate frame by frame until we return to launch height
-        # This accounts for the min_jump_velocity cut on short hops
         hold_frames = 6 if action == 3 else 18
-        y = 0.0
-        vy_sim = vy
-        x = 0.0
+        vx = self.mario.horizontal_speed
+        vy = self.mario.jump_force
+        gravity = GRAVITY_PER_SECOND
         dt = 1 / 60
 
-        for frame in range(500):  # safety limit
-            vy_sim += gravity * dt
-            y += vy_sim * dt
-            x += vx * dt
+        y = 0.0
+        x = 0.0
 
-            # Apply jump cut after hold expires
-            if frame >= hold_frames and vy_sim < self.mario.min_jump_velocity:
-                vy_sim = self.mario.min_jump_velocity
+        for frame in range(600):  # safety cap
+            vy += gravity * dt
+            y  += vy * dt
+            x  += vx * dt
 
-            # Landed back at or below launch height
+            # Apply jump cut after hold expires (mirrors mario.py behaviour)
+            if frame >= hold_frames and vy < self.mario.min_jump_velocity:
+                vy = self.mario.min_jump_velocity
+
+            # Landed at or below launch height (skip first few frames)
             if frame > 5 and y >= 0:
                 break
 
         return self.mario.x + x
 
+    # ------------------------------------------------------------------
     def _get_state(self):
         gap_start, gap_end = self._find_gap_ahead(max_look=250)
-        landing_x = self._estimate_landing_x(action=4)  # always report full-jump estimate
+        landing_x = self._estimate_landing_x(action=4)
 
         return np.array([
             self.mario.x,
@@ -317,13 +337,13 @@ class MarioEnv(gym.Env):
             self.mario.velocity_x,
             self.mario.velocity_y,
             float(self.mario.on_ground),
-            # Ground sensors
+            # Ground sensors (foot level)
             float(self._ground_ahead(16)),
             float(self._ground_ahead(32)),
             float(self._ground_ahead(64)),
             float(self._ground_ahead(96)),
             float(self._ground_ahead(128)),
-            # Wall sensors
+            # Wall sensors (torso level)
             float(self._wall_ahead(16)),
             float(self._wall_ahead(32)),
             float(self._wall_ahead(48)),
@@ -335,6 +355,7 @@ class MarioEnv(gym.Env):
             gap_end    if gap_end    is not None else 0.0,
         ], dtype=np.float32)
 
+    # ------------------------------------------------------------------
     def _update_camera(self):
         if self.mario.x - self.camera_x > SCREEN_WIDTH // 2:
             self.camera_x = self.mario.x - SCREEN_WIDTH // 2
